@@ -1,0 +1,27 @@
+[package]
+name = "polysniper"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "signal"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", features = ["json", "native-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+dotenvy = "0.15"
+dashmap = "6"
+parking_lot = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
