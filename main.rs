@@ -65,6 +65,9 @@ struct Config {
     hard_max_entry: f64,
     entry_limit_wait_ms: u64,
     entry_limit_poll_ms: u64,
+    watch_zone_ratio: f64,
+    candidate_poll_ms: u64,
+    candidate_quote_ttl_ms: u64,
     exit_limit_retries: u32,
     exit_limit_wait_ms: u64,
     exit_limit_poll_ms: u64,
@@ -125,6 +128,9 @@ impl Config {
             hard_max_entry: env_f64("HARD_MAX_ENTRY", 0.59),
             entry_limit_wait_ms: env_u64("ENTRY_LIMIT_WAIT_MS", 2200),
             entry_limit_poll_ms: env_u64("ENTRY_LIMIT_POLL_MS", 250),
+            watch_zone_ratio: env_f64("WATCH_ZONE_RATIO", 0.80),
+            candidate_poll_ms: env_u64("CANDIDATE_POLL_MS", 120),
+            candidate_quote_ttl_ms: env_u64("CANDIDATE_QUOTE_TTL_MS", 1500),
             exit_limit_retries: env_u32("EXIT_LIMIT_RETRIES", 4),
             exit_limit_wait_ms: env_u64("EXIT_LIMIT_WAIT_MS", 1200),
             exit_limit_poll_ms: env_u64("EXIT_LIMIT_POLL_MS", 200),
@@ -191,6 +197,15 @@ struct MarketInfo {
 }
 
 #[derive(Clone, Debug)]
+struct CandidateQuote {
+    asset: String,
+    dir: String,
+    ask: f64,
+    token: String,
+    observed_at_ms: i64,
+}
+
+#[derive(Clone, Debug)]
 struct TpOrder {
     id: String,
     shares: f64,
@@ -211,12 +226,14 @@ struct BotState {
     session_start: i64,
     trade_ledger_file: String,
     market_cache: HashMap<String, MarketInfo>,
+    window_opens: HashMap<String, f64>,
     attempt_in_flight: bool,
     recent_skips: Vec<String>,
     recent_signals: Vec<String>,
 }
 
 type PriceMap = Arc<DashMap<String, f64>>;
+type QuoteMap = Arc<DashMap<String, CandidateQuote>>;
 type State = Arc<Mutex<BotState>>;
 
 #[tokio::main]
@@ -238,11 +255,13 @@ async fn main() {
         session_start: unix_now(),
         trade_ledger_file: format!("trade_ledger_{}.jsonl", session_stamp),
         market_cache: HashMap::new(),
+        window_opens: HashMap::new(),
         attempt_in_flight: false,
         recent_skips: Vec::new(),
         recent_signals: Vec::new(),
     }));
     let prices: PriceMap = Arc::new(DashMap::new());
+    let quotes: QuoteMap = Arc::new(DashMap::new());
 
     {
         let p = prices.clone();
@@ -277,7 +296,18 @@ async fn main() {
         });
     }
 
-    run_bot(prices, state, http, cfg).await;
+    {
+        let p = prices.clone();
+        let s = state.clone();
+        let h = http.clone();
+        let q = quotes.clone();
+        let c = cfg.clone();
+        tokio::spawn(async move {
+            candidate_quote_refresher(p, s, h, q, c).await;
+        });
+    }
+
+    run_bot(prices, quotes, state, http, cfg).await;
 }
 
 async fn call_script(cfg: &Config, args: &[String]) -> serde_json::Value {
@@ -771,7 +801,7 @@ async fn reconcile_wallet_state(cfg: &Config, state: &State) {
     }
 }
 
-async fn run_bot(prices: PriceMap, state: State, http: reqwest::Client, cfg: Config) {
+async fn run_bot(prices: PriceMap, quotes: QuoteMap, state: State, http: reqwest::Client, cfg: Config) {
     let mut opens: HashMap<String, f64> = HashMap::new();
     let mut last_window: i64 = 0;
     let mut last_reconcile_at: i64 = 0;
@@ -800,6 +830,7 @@ async fn run_bot(prices: PriceMap, state: State, http: reqwest::Client, cfg: Con
             {
                 let mut st = state.lock();
                 st.market_cache.clear();
+                st.window_opens = opens.clone();
                 st.attempt_in_flight = false;
             }
 
@@ -817,6 +848,10 @@ async fn run_bot(prices: PriceMap, state: State, http: reqwest::Client, cfg: Con
             if let Some(&price) = snap.get(asset) {
                 opens.entry(asset.to_string()).or_insert(price);
             }
+        }
+        {
+            let mut st = state.lock();
+            st.window_opens = opens.clone();
         }
 
         if elapsed <= cfg.entry_secs {
@@ -872,10 +907,11 @@ async fn run_bot(prices: PriceMap, state: State, http: reqwest::Client, cfg: Con
                         );
 
                         let h = http.clone();
+                        let q = quotes.clone();
                         let s = state.clone();
                         let c = cfg.clone();
                         tokio::spawn(async move {
-                            trade_signal(h, s, asset, dir, window_ts, c).await;
+                            trade_signal(h, q, s, asset, dir, window_ts, c).await;
                         });
                     }
                 }
@@ -886,6 +922,65 @@ async fn run_bot(prices: PriceMap, state: State, http: reqwest::Client, cfg: Con
         print!("\x1B[H\x1B[J{frame}");
         let _ = std::io::stdout().flush();
         tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
+async fn candidate_quote_refresher(prices: PriceMap, state: State, http: reqwest::Client, quotes: QuoteMap, cfg: Config) {
+    loop {
+        let snapshot = prices.iter().map(|e| (e.key().clone(), *e.value())).collect::<HashMap<_, _>>();
+        let (market_cache, window_opens, open_assets, unresolved_assets) = {
+            let st = state.lock();
+            (
+                st.market_cache.clone(),
+                st.window_opens.clone(),
+                st.open.keys().cloned().collect::<Vec<_>>(),
+                st.unresolved.keys().cloned().collect::<Vec<_>>(),
+            )
+        };
+
+        for (asset, _) in display_assets() {
+            if open_assets.iter().any(|a| a == asset) || unresolved_assets.iter().any(|a| a == asset) {
+                quotes.remove(asset);
+                continue;
+            }
+
+            let Some(now_px) = snapshot.get(asset).copied() else {
+                quotes.remove(asset);
+                continue;
+            };
+            let Some(open_px) = window_opens.get(asset).copied() else {
+                quotes.remove(asset);
+                continue;
+            };
+            if open_px <= 0.0 {
+                quotes.remove(asset);
+                continue;
+            }
+
+            let mv = (now_px - open_px) / open_px * 100.0;
+            let thr = cfg.threshold_for(asset);
+            if mv.abs() < thr * cfg.watch_zone_ratio {
+                quotes.remove(asset);
+                continue;
+            }
+
+            let Some(market) = market_cache.get(asset).cloned() else {
+                continue;
+            };
+            let dir = if mv > 0.0 { "YES" } else { "NO" }.to_string();
+            let token = if dir == "YES" { market.yes_token } else { market.no_token };
+            if let Some(ask) = get_price(&http, &token, "BUY").await {
+                quotes.insert(asset.to_string(), CandidateQuote {
+                    asset: asset.to_string(),
+                    dir,
+                    ask,
+                    token,
+                    observed_at_ms: unix_now_ms(),
+                });
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(cfg.candidate_poll_ms.max(50))).await;
     }
 }
 
@@ -942,7 +1037,7 @@ async fn cache_markets(http: reqwest::Client, state: State, window_ts: i64, entr
     );
 }
 
-async fn trade_signal(http: reqwest::Client, state: State, asset: String, dir: String, window_ts: i64, cfg: Config) {
+async fn trade_signal(http: reqwest::Client, quotes: QuoteMap, state: State, asset: String, dir: String, window_ts: i64, cfg: Config) {
     let market = {
         let st = state.lock();
         st.market_cache.get(&asset).cloned()
@@ -965,14 +1060,26 @@ async fn trade_signal(http: reqwest::Client, state: State, asset: String, dir: S
         market.no_token.clone()
     };
 
-    let ask = match get_price(&http, &token, "BUY").await {
-        Some(price) if price > 0.0 => price,
-        _ => {
-            state.lock().attempt_in_flight = false;
-            let msg = format!("{} {} no BUY price", asset.to_uppercase(), dir);
-            push_skip(&state, msg.clone());
-            warn!("[SKIP] {}", msg);
-            return;
+    let cached_ask = quotes.get(&asset).and_then(|q| {
+        if q.dir == dir && q.token == token && unix_now_ms() - q.observed_at_ms <= cfg.candidate_quote_ttl_ms as i64 {
+            Some(q.ask)
+        } else {
+            None
+        }
+    });
+
+    let ask = if let Some(price) = cached_ask {
+        price
+    } else {
+        match get_price(&http, &token, "BUY").await {
+            Some(price) if price > 0.0 => price,
+            _ => {
+                state.lock().attempt_in_flight = false;
+                let msg = format!("{} {} no BUY price", asset.to_uppercase(), dir);
+                push_skip(&state, msg.clone());
+                warn!("[SKIP] {}", msg);
+                return;
+            }
         }
     };
 
@@ -2200,6 +2307,13 @@ fn unix_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64
+}
+
+fn unix_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
 }
 
 fn round2(x: f64) -> f64 {
